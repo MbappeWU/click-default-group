@@ -52,6 +52,41 @@ __all__ = ['DefaultGroup']
 __version__ = '1.2.4'
 
 
+class _DelimiterToken(str):
+    """Observe Click's native delimiter branch without changing its parser."""
+
+    __hash__ = str.__hash__
+
+    def __new__(cls, value, observed_args):
+        token = str.__new__(cls, value)
+        token.original = value
+        token.observed_args = observed_args
+        token.native_remainder = None
+        return token
+
+    def __eq__(self, other):
+        if other == '--' and self.native_remainder is None:
+            self.native_remainder = list(self.observed_args)
+        return str.__eq__(self, other)
+
+
+def _restore_delimiter_tokens(value, seen=None):
+    if type(value) is _DelimiterToken:
+        return value.original
+    if type(value) not in (list, tuple):
+        return value
+    if seen is None:
+        seen = set()
+    if id(value) in seen:
+        return value
+    seen.add(id(value))
+    restored = [_restore_delimiter_tokens(item, seen) for item in value]
+    if all(original is replacement
+           for original, replacement in zip(value, restored)):
+        return value
+    return type(value)(restored)
+
+
 class DefaultGroup(click.Group):
     """Invokes a subcommand marked with `default=True` if any subcommand not
     chosen.
@@ -81,6 +116,47 @@ class DefaultGroup(click.Group):
             args.insert(0, self.default_cmd_name)
         return super(DefaultGroup, self).parse_args(ctx, args)
 
+    def make_parser(self, ctx):
+        parser = super(DefaultGroup, self).make_parser(ctx)
+        native_parse_args = parser.parse_args
+
+        def parse_args(args):
+            ctx._default_group_separator_index = None
+            observed_args = []
+            delimiter_tokens = []
+            for arg in args:
+                if isinstance(arg, (str, type(u''))) and arg == '--':
+                    token = _DelimiterToken(arg, observed_args)
+                    delimiter_tokens.append(token)
+                    observed_args.append(token)
+                else:
+                    observed_args.append(arg)
+
+            try:
+                opts, parsed_args, order = native_parse_args(observed_args)
+            finally:
+                args[:] = _restore_delimiter_tokens(observed_args)
+            for name, value in list(opts.items()):
+                opts[name] = _restore_delimiter_tokens(value)
+            parsed_args[:] = _restore_delimiter_tokens(parsed_args)
+            for arg in delimiter_tokens:
+                if (
+                    type(arg) is _DelimiterToken
+                    and arg.native_remainder is not None
+                ):
+                    remainder = [
+                        _restore_delimiter_tokens(item)
+                        for item in arg.native_remainder
+                    ]
+                    ctx._default_group_separator_index = max(
+                        0, len(parsed_args) - len(remainder))
+                    break
+
+            return opts, parsed_args, order
+
+        parser.parse_args = parse_args
+        return parser
+
     def get_command(self, ctx, cmd_name):
         if cmd_name not in self.commands:
             # No command name matched.
@@ -93,6 +169,9 @@ class DefaultGroup(click.Group):
         cmd_name, cmd, args = base.resolve_command(ctx, args)
         if hasattr(ctx, 'arg0'):
             args.insert(0, ctx.arg0)
+            position = getattr(ctx, '_default_group_separator_index', None)
+            if position is not None:
+                args.insert(position, '--')
             cmd_name = cmd.name
         return cmd_name, cmd, args
 
