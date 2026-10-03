@@ -43,6 +43,7 @@
       bar
 
 """
+from collections import deque
 import warnings
 
 import click
@@ -112,6 +113,7 @@ class DefaultGroup(click.Group):
         self.default_cmd_name = cmd_name
 
     def parse_args(self, ctx, args):
+        ctx._default_group_previous_remaining = None
         if not args and self.default_if_no_args:
             args.insert(0, self.default_cmd_name)
         return super(DefaultGroup, self).parse_args(ctx, args)
@@ -140,10 +142,9 @@ class DefaultGroup(click.Group):
                 opts[name] = _restore_delimiter_tokens(value)
             parsed_args[:] = _restore_delimiter_tokens(parsed_args)
             for arg in delimiter_tokens:
-                if (
-                    type(arg) is _DelimiterToken
-                    and arg.native_remainder is not None
-                ):
+                if type(arg) is not _DelimiterToken:
+                    continue
+                if arg.native_remainder is not None:
                     remainder = [
                         _restore_delimiter_tokens(item)
                         for item in arg.native_remainder
@@ -158,6 +159,7 @@ class DefaultGroup(click.Group):
         return parser
 
     def get_command(self, ctx, cmd_name):
+        ctx.__dict__.pop('arg0', None)
         if cmd_name not in self.commands:
             # No command name matched.
             ctx.arg0 = cmd_name
@@ -165,15 +167,98 @@ class DefaultGroup(click.Group):
         return super(DefaultGroup, self).get_command(ctx, cmd_name)
 
     def resolve_command(self, ctx, args):
+        ctx.__dict__.pop('arg0', None)
+        position = getattr(ctx, '_default_group_separator_index', None)
+        if ctx.resilient_parsing:
+            ctx._default_group_separator_index = None
+        if self.chain and ctx.resilient_parsing:
+            remaining = tuple(args)
+            previous = getattr(ctx, '_default_group_previous_remaining', None)
+            if previous == remaining:
+                if ctx.resilient_parsing:
+                    return None, None, args
+                ctx.fail('Default command did not consume any arguments.')
+            ctx._default_group_previous_remaining = remaining
         base = super(DefaultGroup, self)
-        cmd_name, cmd, args = base.resolve_command(ctx, args)
-        if hasattr(ctx, 'arg0'):
-            args.insert(0, ctx.arg0)
-            position = getattr(ctx, '_default_group_separator_index', None)
+        try:
+            cmd_name, cmd, args = base.resolve_command(ctx, args)
+        finally:
+            arg0 = ctx.__dict__.pop('arg0', None)
+        if cmd is not None and arg0 is not None:
+            args.insert(0, arg0)
             if position is not None:
                 args.insert(position, '--')
             cmd_name = cmd.name
         return cmd_name, cmd, args
+
+    def invoke(self, ctx):
+        try:
+            if not self.chain:
+                return super(DefaultGroup, self).invoke(ctx)
+            if hasattr(ctx, '_protected_args'):
+                protected_name = '_protected_args'
+            elif hasattr(ctx, 'protected_args'):
+                protected_name = 'protected_args'
+            else:
+                protected_name = None
+            args = ctx.args
+            if protected_name is not None:
+                args = list(getattr(ctx, protected_name)) + args
+            if not args:
+                return super(DefaultGroup, self).invoke(ctx)
+            next_invoke = super(DefaultGroup, self).invoke
+            next_function = getattr(
+                next_invoke, '__func__',
+                getattr(next_invoke, 'im_func', next_invoke))
+            native_function = getattr(
+                click.Group.invoke, '__func__',
+                getattr(click.Group.invoke, 'im_func', click.Group.invoke))
+            if next_function is not native_function:
+                ctx.fail('Place custom invoke wrappers before DefaultGroup '
+                         'in the class inheritance order.')
+            if protected_name is not None:
+                ctx.args = []
+                setattr(ctx, protected_name, [])
+            with ctx:
+                ctx.invoked_subcommand = '*'
+                click.Command.invoke(self, ctx)
+                pending = deque()
+                try:
+                    while args:
+                        before = tuple(args)
+                        name, command, command_args = self.resolve_command(
+                            ctx, args)
+                        ctx._default_group_separator_index = None
+                        child = command.make_context(
+                            name, command_args, parent=ctx,
+                            allow_extra_args=True,
+                            allow_interspersed_args=False,
+                        )
+                        pending.append(child)
+                        args, child.args = child.args, []
+                        if tuple(args) == before:
+                            ctx.fail(
+                                'Default command did not consume '
+                                'any arguments.')
+                    results = []
+                    while pending:
+                        child = pending.popleft()
+                        with child:
+                            results.append(child.command.invoke(child))
+                finally:
+                    while pending:
+                        pending.pop().close()
+                if hasattr(self, '_result_callback'):
+                    result_callback = self._result_callback
+                else:
+                    result_callback = self.result_callback
+                if result_callback is not None:
+                    return ctx.invoke(result_callback, results, **ctx.params)
+                return results
+        finally:
+            ctx.__dict__.pop('arg0', None)
+            ctx._default_group_separator_index = None
+            ctx._default_group_previous_remaining = None
 
     def format_commands(self, ctx, formatter):
         formatter = DefaultCommandFormatter(self, formatter, mark='*')

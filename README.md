@@ -51,6 +51,27 @@ $ cli.py bar
 bar
 ```
 
+Chained commands
+----------------
+
+With `chain=True`, an implicit default command can be used more than once when
+it consumes arguments. For example, a default command that takes one argument
+can handle `cli.py first second`, and can be mixed with explicit commands.
+A default command that cannot consume an unknown token raises a usage error
+instead of repeating indefinitely. Shell completion also stops safely on
+that input. Group callbacks keep Click's normal execution order; an invalid
+chain does not execute its subcommand callbacks.
+
+An option-only default can consume its options before the next command.
+After an explicit command, use the next command's name to separate its options
+from the previous command's options, as required by Click's chain parser.
+
+If combining `DefaultGroup` with another group class that overrides `invoke`,
+put that wrapper class before `DefaultGroup` in the inheritance order. A
+non-empty chain rejects the opposite order rather than silently skipping the
+wrapper. Ordinary subclasses overriding `invoke` and calling `super` work
+normally.
+
 Compatibility
 -------------
 
